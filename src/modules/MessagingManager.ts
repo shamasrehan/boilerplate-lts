@@ -1,14 +1,14 @@
-import amqp, { Connection, Channel, ConsumeMessage, Options } from 'amqplib';
+import amqp, { Channel, ConsumeMessage, Options, Connection as AmqpConnection } from 'amqplib';
 import Joi from 'joi';
 import { v4 as uuidv4 } from 'uuid';
-import { logger } from '../utils/logger';
-import { config } from '../config';
+import { logger } from '../utils/logger.js';
+import { config } from '../config/index.js';
 import {
   IIncomingMessage,
   IOutgoingMessage,
   IMessageAcknowledgment,
   IHealthStatus,
-} from '../types';
+} from '../types/index.js';
 
 // Helper to get RabbitMQ URL from env or config
 function getRabbitMQUrl() {
@@ -17,7 +17,7 @@ function getRabbitMQUrl() {
 }
 
 export class MessagingManager {
-  private connection: amqp.Connection | null = null;
+  private connection: any | null = null;  // Using any temporarily to bypass type issues
   private channel: amqp.Channel | null = null;
   private confirmChannel: amqp.ConfirmChannel | null = null;
   private consumeChannel: amqp.Channel | null = null;
@@ -67,6 +67,10 @@ export class MessagingManager {
       this.consumeChannel = await this.connection.createChannel();
       logger.info('Channels created successfully');
 
+      if (!this.channel) {
+        throw new Error('Failed to create channel');
+      }
+
       // Create exchanges
       await this.channel.assertExchange(this.incomingExchange, 'direct', { durable: true });
       await this.channel.assertExchange(this.outgoingExchange, 'direct', { durable: true });
@@ -97,13 +101,13 @@ export class MessagingManager {
     } catch (error) {
       logger.error('Failed to connect to RabbitMQ:', error);
       this.isConnected = false;
-      this.reconnect();
+      setTimeout(() => this.reconnect(), 5000);
       throw error;
     }
   }
 
   private async reconnect(): Promise<void> {
-    if (!this.isConnected) {
+    if (!this.isConnected && !this.connectionPromise) {
       logger.info('Attempting to reconnect to RabbitMQ...');
       try {
         // Close existing channels and connection
@@ -133,11 +137,14 @@ export class MessagingManager {
         this.channel = null;
         this.consumeChannel = null;
         this.connection = null;
+        this.connectionPromise = null;
 
         // Attempt to reconnect
-        await this.connect();
+        this.connectionPromise = this.connect();
+        await this.connectionPromise;
       } catch (error) {
         logger.error('Reconnection failed:', error);
+        this.connectionPromise = null;
         setTimeout(() => this.reconnect(), 5000);
       }
     }
@@ -170,6 +177,13 @@ export class MessagingManager {
           }
         }
       }
+      if (this.consumeChannel) {
+        try {
+          await this.consumeChannel.close();
+        } catch (err) {
+          logger.warn('Error closing consume channel:', err);
+        }
+      }
       if (this.connection) {
         await this.connection.close();
       }
@@ -186,13 +200,12 @@ export class MessagingManager {
       
       await this.waitForConnection();
       
-      if (!this.connection) {
+      if (!this.connection || !this.consumeChannel) {
         throw new Error('RabbitMQ connection not established');
       }
 
-      this.consumeChannel = await this.connection.createChannel();
       await this.consumeChannel.prefetch(1);
-      logger.info('Consume channel created and prefetch set');
+      logger.info('Consume channel prefetch set');
 
       // Set up consumer for incoming messages
       await this.consumeChannel.consume(
@@ -226,9 +239,17 @@ export class MessagingManager {
             }
 
             // Validate message
-            if (!message.id || !message.content || !message.timestamp) {
+            const validatedMessage = this.validateIncomingMessage(message);
+            if (!validatedMessage) {
               logger.error('Invalid message format', { message });
               this.consumeChannel?.nack(msg, false, false);
+              return;
+            }
+
+            // Skip if this is a response message
+            if (validatedMessage.metadata?.isResponse) {
+              logger.info('Skipping response message', { messageId: validatedMessage.id });
+              this.consumeChannel?.ack(msg);
               return;
             }
 
@@ -239,14 +260,14 @@ export class MessagingManager {
               return;
             }
 
-            await handler(message);
+            await handler(validatedMessage);
             logger.info('Message processed successfully', { messageId });
             
             this.consumeChannel?.ack(msg);
             logger.info('Message acknowledged', { messageId });
           } catch (error) {
             logger.error('Error processing message:', error);
-            this.consumeChannel?.nack(msg, false, false);
+            this.consumeChannel?.nack(msg, false, true); // Requeue on error
           }
         },
         {
@@ -269,6 +290,8 @@ export class MessagingManager {
         logger.error('Invalid incoming message format:', error.details);
         return null;
       }
+      // Ensure timestamp is a Date object
+      value.timestamp = new Date(value.timestamp);
       return value as IIncomingMessage;
     } catch (error) {
       logger.error('Error validating incoming message:', error);
@@ -283,36 +306,12 @@ export class MessagingManager {
         logger.error('Invalid outgoing message format:', error.details);
         return null;
       }
+      // Ensure timestamp is a Date object
+      value.timestamp = new Date(value.timestamp);
       return value as IOutgoingMessage;
     } catch (error) {
       logger.error('Error validating outgoing message:', error);
       return null;
-    }
-  }
-
-  private async acknowledgeMessage(msg: amqp.ConsumeMessage, success: boolean, reason?: string): Promise<void> {
-    try {
-      if (!this.channel) return;
-
-      if (success) {
-        this.channel.ack(msg);
-        logger.debug('Message acknowledged successfully');
-      } else {
-        this.channel.nack(msg, false, false); // Don't requeue failed messages
-        logger.warn('Message rejected:', reason);
-      }
-
-      // Create acknowledgment record
-      const ack: IMessageAcknowledgment = {
-        messageId: msg.properties.messageId || 'unknown',
-        status: success ? 'success' : 'failure',
-        reason,
-        timestamp: new Date(),
-      };
-
-      logger.info('Message acknowledgment:', ack);
-    } catch (error) {
-      logger.error('Error acknowledging message:', error);
     }
   }
 
@@ -342,31 +341,30 @@ export class MessagingManager {
           reject(new Error('Message send timeout'));
         }, 5000);
 
-        this.channel?.publish(
-          this.outgoingExchange,
-          this.outgoingRoutingKey,
-          content,
-          {
-            messageId: message.id,
-            persistent: true,
-            contentType: 'application/json',
-            contentEncoding: 'utf8',
-            headers: message.metadata
-          },
-          (err) => {
-            clearTimeout(timeout);
-            if (err) {
-              logger.error('Failed to publish message:', err);
-              reject(err);
-            } else {
-              logger.info('Message published successfully', { 
-                messageId: message.id,
-                exchange: this.outgoingExchange
-              });
-              resolve();
+        try {
+          this.channel?.publish(
+            this.outgoingExchange,
+            this.outgoingRoutingKey,
+            content,
+            {
+              messageId: message.id,
+              persistent: true,
+              contentType: 'application/json',
+              contentEncoding: 'utf8',
+              headers: message.metadata
             }
-          }
-        );
+          );
+          clearTimeout(timeout);
+          logger.info('Message published successfully', { 
+            messageId: message.id,
+            exchange: this.outgoingExchange
+          });
+          resolve();
+        } catch (error) {
+          clearTimeout(timeout);
+          logger.error('Failed to publish message:', error);
+          reject(error);
+        }
       });
     } catch (error) {
       logger.error('Error sending message:', error);
@@ -391,7 +389,7 @@ export class MessagingManager {
     return {
       id: uuidv4(),
       content,
-      metadata,
+      metadata: metadata || {},
       timestamp: new Date(),
     };
   }
@@ -400,7 +398,7 @@ export class MessagingManager {
     return {
       id: uuidv4(),
       content,
-      metadata,
+      metadata: metadata || {},
       timestamp: new Date(),
     };
   }

@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
-import { logger } from '../utils/logger';
-import { config } from '../config/index';
+import { logger } from '../utils/logger.js';
+import { config } from '../config/index.js';
 import {
   IIncomingMessage,
   IOutgoingMessage,
@@ -16,11 +16,11 @@ import {
   JobStatus,
   ILLMResponse,
   IExecutionContext,
-} from '../types/index';
-import { FunctionsManager } from './FunctionsManager';
-import { MessagingManager } from './MessagingManager';
-import { JobsQueueManager } from './JobsQueueManager';
-import { LLMManager } from './LLMManager';
+} from '../types/index.js';
+import { FunctionsManager } from './FunctionsManager.js';
+import { MessagingManager } from './MessagingManager.js';
+import { JobsQueueManager } from './JobsQueueManager.js';
+import { LLMManager } from './LLMManager.js';
 import { Server } from 'socket.io';
 
 export class AgentMaster {
@@ -162,19 +162,22 @@ export class AgentMaster {
         timestamp: new Date()
       });
 
-      // Only send error response if we haven't already sent one
-      if (!this.activeRequests.has(message.id)) {
-        const errorResponse = this.messagingManager.createOutgoingMessage(
-          `I apologize, but I encountered an error while processing your request: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          { 
-            error: true, 
-            requestId,
-            originalMessageId: message.id,
-            errorTimestamp: new Date().toISOString(),
-            isResponse: true // Mark as response to prevent reprocessing
-          }
-        );
+      // Send error response
+      const errorResponse = this.messagingManager.createOutgoingMessage(
+        `I apologize, but I encountered an error while processing your request: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        { 
+          error: true, 
+          requestId,
+          originalMessageId: message.id,
+          errorTimestamp: new Date().toISOString(),
+          isResponse: true // Mark as response to prevent reprocessing
+        }
+      );
+      
+      try {
         await this.messagingManager.sendMessage(errorResponse);
+      } catch (sendError) {
+        logger.error('Failed to send error response:', sendError);
       }
     } finally {
       this.activeRequests.delete(message.id);
@@ -230,7 +233,7 @@ Respond with the JSON structure as specified in your system prompt.`;
 
       // Execute the decision
       const result = await this.executeDecision(decision, request);
-      logger.info('Function executed', { result });
+      logger.info('Decision executed', { result });
 
       // Generate final response
       const responseMessage = this.messagingManager.createOutgoingMessage(
@@ -346,7 +349,7 @@ Respond with the JSON structure as specified in your system prompt.`;
         functionName: decision.function_name
       });
 
-      const jobData = {
+      const jobData: IJobData = {
         functionName: decision.function_name,
         parameters: decision.parameters || {},
         executionType: decision.execution_type || JobExecutionType.INSTANT,
@@ -420,20 +423,20 @@ Respond with the JSON structure as specified in your system prompt.`;
           return;
         }
 
-        logger.info('Job status check', { 
+        logger.debug('Job status check', { 
           jobId, 
           status: job.status,
           elapsedTime: Date.now() - startTime 
         });
 
-        if (job.status === 'completed') {
+        if (job.status === JobStatus.COMPLETED) {
           logger.info('Job completed', { jobId, result: job.result });
           clearInterval(checkInterval);
           resolve(job.result);
           return;
         }
 
-        if (job.status === 'failed') {
+        if (job.status === JobStatus.FAILED) {
           logger.error('Job failed', { jobId, error: job.error });
           clearInterval(checkInterval);
           reject(new Error(job.error || 'Job failed'));
@@ -446,7 +449,7 @@ Respond with the JSON structure as specified in your system prompt.`;
           reject(new Error('Job execution timeout'));
           return;
         }
-      }, 1000);
+      }, 500); // Check every 500ms
     });
   }
 
@@ -645,7 +648,7 @@ System Status:
 Your primary responsibilities:
 1. Analyze incoming messages to understand user intent
 2. Select the most appropriate function from available functions
-3. Determine execution type (INSTANT, SCHEDULE, REPEAT)
+3. Determine execution type (instant, schedule, repeat)
 4. Extract necessary parameters for function execution
 5. Handle job management (cancel, reschedule, etc.)
 6. Craft appropriate responses based on execution results
@@ -656,9 +659,9 @@ Available function types:
 - WORKER: Functions that can use other LLM instances
 
 Execution types:
-- INSTANT: Execute immediately
-- SCHEDULE: Execute at specified future time
-- REPEAT: Execute repeatedly (only for RUNNER functions)
+- instant: Execute immediately
+- schedule: Execute at specified future time
+- repeat: Execute repeatedly (only for RUNNER functions)
 
 When responding, you must provide a JSON response with this structure:
 {

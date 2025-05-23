@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { logger } from '../utils/logger';
+import { fileURLToPath } from 'url';
+import { logger } from '../utils/logger.js';
 import {
   ICustomFunction,
   IFunctionDefinition,
@@ -8,7 +9,10 @@ import {
   FunctionType,
   IHealthStatus,
   IExecutionContext,
-} from '../types/index';
+} from '../types/index.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export class FunctionsManager {
   private functions: Map<string, ICustomFunction> = new Map();

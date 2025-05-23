@@ -1,6 +1,7 @@
 let autoScroll = true;
 let logCounter = 0;
 let socket = null;
+let currentMessageId = null;
 
 // Initialize the application
 document.addEventListener('DOMContentLoaded', function() {
@@ -47,36 +48,114 @@ function setupWebSocket() {
     socket = io();
 
     socket.on('connect', () => {
-        logMessage('info', 'Connected to server');
+        logMessage('info', 'Connected to server via WebSocket');
+        updateConnectionStatus(true);
     });
 
     socket.on('disconnect', () => {
         logMessage('warn', 'Disconnected from server');
+        updateConnectionStatus(false);
     });
 
+    // Message processing events
     socket.on('message:processing', (data) => {
         logMessage('info', `Processing message ${data.messageId}...`);
+        updateMessageStatus('processing', data);
     });
 
     socket.on('message:orchestration', (data) => {
-        logMessage('info', `Orchestrating message ${data.messageId}...`);
+        logMessage('info', `Orchestrating message ${data.messageId} - LLM analyzing request...`);
+        updateMessageStatus('orchestration', data);
     });
 
     socket.on('message:responding', (data) => {
         logMessage('info', `Sending response for message ${data.messageId}...`);
+        updateMessageStatus('responding', data);
     });
 
     socket.on('message:complete', (data) => {
         const responseOutput = document.getElementById('responseOutput');
-        responseOutput.value = JSON.stringify(data.response, null, 2);
+        responseOutput.value = typeof data.response === 'object' 
+            ? JSON.stringify(data.response, null, 2)
+            : data.response.content || data.response;
+        
         logMessage('info', `Message ${data.messageId} processed successfully`);
+        updateMessageStatus('complete', data);
+        currentMessageId = null;
+        enableSendButton();
     });
 
     socket.on('message:error', (data) => {
         const responseOutput = document.getElementById('responseOutput');
         responseOutput.value = `Error: ${data.error}`;
         logMessage('error', `Error processing message ${data.messageId}: ${data.error}`);
+        updateMessageStatus('error', data);
+        currentMessageId = null;
+        enableSendButton();
     });
+
+    // Job execution events
+    socket.on('job:created', (data) => {
+        logMessage('info', `Job created: ${data.jobId} for function ${data.functionName}`);
+    });
+
+    socket.on('job:started', (data) => {
+        logMessage('info', `Job started: ${data.jobId}`);
+    });
+
+    socket.on('job:completed', (data) => {
+        logMessage('info', `Job completed: ${data.jobId}`);
+    });
+
+    socket.on('job:failed', (data) => {
+        logMessage('error', `Job failed: ${data.jobId} - ${data.error}`);
+    });
+}
+
+function updateConnectionStatus(connected) {
+    const statusLights = document.getElementById('statusLights');
+    const wsStatus = document.querySelector('.ws-status');
+    
+    if (!wsStatus) {
+        const statusItem = document.createElement('div');
+        statusItem.className = 'status-item ws-status';
+        statusItem.innerHTML = `
+            <div class="status-light ${connected ? 'healthy' : 'unhealthy'}"></div>
+            WebSocket
+        `;
+        statusLights.insertBefore(statusItem, statusLights.firstChild);
+    } else {
+        const light = wsStatus.querySelector('.status-light');
+        light.className = `status-light ${connected ? 'healthy' : 'unhealthy'}`;
+    }
+}
+
+function updateMessageStatus(status, data) {
+    const statusContainer = document.getElementById('messageStatus');
+    if (!statusContainer) {
+        const responsePanel = document.querySelector('.panel:nth-child(2) .panel-header');
+        const statusDiv = document.createElement('div');
+        statusDiv.id = 'messageStatus';
+        statusDiv.style.fontSize = '0.85rem';
+        statusDiv.style.color = '#667eea';
+        statusDiv.style.marginLeft = 'auto';
+        responsePanel.insertBefore(statusDiv, responsePanel.lastChild);
+    }
+    
+    const statusText = {
+        'processing': 'Processing...',
+        'orchestration': 'Analyzing with LLM...',
+        'responding': 'Generating response...',
+        'complete': 'Complete',
+        'error': 'Error'
+    };
+    
+    const statusElement = document.getElementById('messageStatus');
+    if (statusElement) {
+        statusElement.textContent = statusText[status] || status;
+        statusElement.style.color = status === 'error' ? '#ef4444' : 
+                                  status === 'complete' ? '#4ade80' : '#667eea';
+    }
 }
 
 async function initializeApp() {
@@ -106,7 +185,10 @@ async function loadMessageTemplates() {
         
         data.templates.forEach(template => {
             const option = document.createElement('option');
-            option.value = template.content;
+            option.value = JSON.stringify({
+                content: template.content,
+                isTemplate: true
+            });
             option.textContent = `${template.name} - ${template.description}`;
             select.appendChild(option);
         });
@@ -125,11 +207,32 @@ async function loadFunctions() {
         const select = document.getElementById('functionSelect');
         select.innerHTML = '<option value="">View function definitions...</option>';
         
+        // Group functions by type
+        const grouped = {
+            helper: [],
+            runner: [],
+            worker: []
+        };
+        
         data.functions.forEach(func => {
-            const option = document.createElement('option');
-            option.value = func.name;
-            option.textContent = `${func.name} (${func.type}) - ${func.description}`;
-            select.appendChild(option);
+            grouped[func.type].push(func);
+        });
+        
+        // Add grouped options
+        Object.entries(grouped).forEach(([type, funcs]) => {
+            if (funcs.length > 0) {
+                const optgroup = document.createElement('optgroup');
+                optgroup.label = type.charAt(0).toUpperCase() + type.slice(1) + ' Functions';
+                
+                funcs.forEach(func => {
+                    const option = document.createElement('option');
+                    option.value = func.name;
+                    option.textContent = `${func.name} - ${func.description}`;
+                    optgroup.appendChild(option);
+                });
+                
+                select.appendChild(optgroup);
+            }
         });
         
         logMessage('info', `Loaded ${data.functions.length} function definitions`);
@@ -152,8 +255,9 @@ async function refreshStatus() {
         logMessage('info', `System status updated - Overall: ${data.status}`);
         
         data.modules.forEach(module => {
-            logMessage(module.status === 'healthy' ? 'info' : 'warn', 
-                      `${module.module}: ${module.status} - ${module.details}`);
+            if (module.status !== 'healthy') {
+                logMessage('warn', `${module.module}: ${module.status} - ${module.details}`);
+            }
         });
         
     } catch (error) {
@@ -167,10 +271,17 @@ async function refreshStatus() {
 
 function updateStatusLights(modules) {
     const container = document.getElementById('statusLights');
+    
+    // Preserve WebSocket status
+    const wsStatus = container.querySelector('.ws-status');
     container.innerHTML = '';
     
+    if (wsStatus) {
+        container.appendChild(wsStatus);
+    }
+    
     if (modules.length === 0) {
-        container.innerHTML = '<div class="status-item"><div class="status-light unknown"></div>System Status Unknown</div>';
+        container.innerHTML += '<div class="status-item"><div class="status-light unknown"></div>System Status Unknown</div>';
         return;
     }
     
@@ -192,21 +303,26 @@ function startStatusMonitoring() {
 }
 
 function handleTemplateSelect() {
-    const template = this.value;
-    if (template) {
-        const messageInput = document.getElementById('messageInput');
-        
-        const messageObj = {
-            content: template,
-            metadata: {
-                userId: "test-user",
-                sessionId: "test-session-" + Date.now(),
-                timestamp: new Date().toISOString()
-            }
-        };
-        
-        messageInput.value = JSON.stringify(messageObj, null, 2);
-        logMessage('info', `Template selected: ${this.options[this.selectedIndex].text}`);
+    const templateData = this.value;
+    if (templateData) {
+        try {
+            const template = JSON.parse(templateData);
+            const messageInput = document.getElementById('messageInput');
+            
+            const messageObj = {
+                content: template.content,
+                metadata: {
+                    userId: "test-user",
+                    sessionId: "test-session-" + Date.now(),
+                    timestamp: new Date().toISOString()
+                }
+            };
+            
+            messageInput.value = JSON.stringify(messageObj, null, 2);
+            logMessage('info', `Template selected: ${this.options[this.selectedIndex].text}`);
+        } catch (error) {
+            logMessage('error', 'Failed to parse template');
+        }
     }
 }
 
@@ -241,23 +357,40 @@ function displayFunctionModal(funcDef) {
     details.innerHTML = `
         <h2>${funcDef.name}</h2>
         <div class="function-definition">
-            <p><strong>Type:</strong> ${funcDef.type}</p>
+            <p><strong>Type:</strong> <span style="color: #667eea; text-transform: uppercase;">${funcDef.type}</span></p>
             <p><strong>Description:</strong> ${funcDef.description}</p>
             <p><strong>Timeout:</strong> ${funcDef.timeout || 30000}ms</p>
             <p><strong>Retries:</strong> ${funcDef.retries || 3}</p>
             
             <h3>Parameters:</h3>
-            ${funcDef.parameters.map(param => `
+            ${funcDef.parameters.length > 0 ? funcDef.parameters.map(param => `
                 <div class="parameter">
-                    <strong>${param.name}</strong> (${param.type}) ${param.required ? '- Required' : '- Optional'}
+                    <strong>${param.name}</strong> (${param.type}) ${param.required ? '<span style="color: #ef4444;">- Required</span>' : '<span style="color: #4ade80;">- Optional</span>'}
                     <p>${param.description}</p>
                     ${param.default !== undefined ? `<p><em>Default: ${param.default}</em></p>` : ''}
                 </div>
-            `).join('')}
+            `).join('') : '<p>No parameters required</p>'}
+            
+            <h3>Example Usage:</h3>
+            <div class="parameter" style="background: #1a1a1a; color: #00ff00; font-family: monospace; padding: 15px;">
+                ${generateExampleUsage(funcDef)}
+            </div>
         </div>
     `;
     
     modal.style.display = 'block';
+}
+
+function generateExampleUsage(funcDef) {
+    const examples = {
+        weather: `"What's the weather in London?"`,
+        mathUtils: `"Calculate the average of 10, 20, 30, 45, 55"`,
+        stringUtils: `"Convert this text to uppercase: hello world"`,
+        timer: `"Set a timer for 5 seconds"`,
+        sentimentAnalysis: `"Analyze sentiment: I love this amazing product!"`
+    };
+    
+    return examples[funcDef.name] || `"Execute ${funcDef.name} function"`;
 }
 
 function closeFunctionModal() {
@@ -270,8 +403,6 @@ async function sendMessage() {
     const sendBtn = document.getElementById('sendBtn');
     
     const originalText = sendBtn.textContent;
-    sendBtn.innerHTML = '<span class="loading"></span> Sending...';
-    sendBtn.disabled = true;
     
     try {
         let messageData;
@@ -281,9 +412,15 @@ async function sendMessage() {
             throw new Error('Please enter a message');
         }
         
+        // Disable button and show loading
+        sendBtn.innerHTML = '<span class="loading"></span> Sending...';
+        sendBtn.disabled = true;
+        responseOutput.value = 'Waiting for response...';
+        
         try {
             messageData = JSON.parse(inputText);
         } catch {
+            // If not JSON, create message object
             messageData = {
                 content: inputText,
                 metadata: {
@@ -311,21 +448,29 @@ async function sendMessage() {
         const result = await response.json();
         
         if (response.ok) {
-            responseOutput.value = JSON.stringify(result, null, 2);
+            currentMessageId = result.messageId;
             logMessage('info', `Message sent successfully - ID: ${result.messageId}`);
-            logMessage('info', 'Waiting for system response...');
+            logMessage('info', 'Waiting for processing pipeline...');
+            
+            // Don't re-enable button yet - wait for WebSocket events
+            sendBtn.innerHTML = '<span class="loading"></span> Processing...';
         } else {
             responseOutput.value = JSON.stringify(result, null, 2);
             logMessage('error', `Failed to send message: ${result.error}`);
+            enableSendButton();
         }
         
     } catch (error) {
         responseOutput.value = `Error: ${error.message}`;
         logMessage('error', `Send message error: ${error.message}`);
-    } finally {
-        sendBtn.textContent = originalText;
-        sendBtn.disabled = false;
+        enableSendButton();
     }
+}
+
+function enableSendButton() {
+    const sendBtn = document.getElementById('sendBtn');
+    sendBtn.textContent = 'Send Message';
+    sendBtn.disabled = false;
 }
 
 function copyResponse() {
@@ -350,9 +495,17 @@ function logMessage(level, message) {
     
     const logEntry = document.createElement('div');
     logEntry.className = 'log-entry';
+    
+    // Add icon based on level
+    const icons = {
+        info: '📘',
+        warn: '⚠️',
+        error: '❌'
+    };
+    
     logEntry.innerHTML = `
         <span class="log-timestamp">[${timestamp}]</span>
-        <span class="log-level-${level}">[${level.toUpperCase()}]</span>
+        <span class="log-level-${level}">${icons[level] || ''} [${level.toUpperCase()}]</span>
         ${message}
     `;
     
@@ -363,6 +516,11 @@ function logMessage(level, message) {
     }
     
     logCounter++;
+    
+    // Limit log entries
+    if (console.children.length > 1000) {
+        console.removeChild(console.firstChild);
+    }
 }
 
 function toggleAutoScroll() {
@@ -379,8 +537,22 @@ function clearLogs() {
     logMessage('info', 'Logs cleared');
 }
 
+// Add workflow visualization
+function showWorkflowStatus() {
+    const workflowSteps = [
+        { id: 'receive', name: 'Message Received', status: 'pending' },
+        { id: 'process', name: 'Processing', status: 'pending' },
+        { id: 'orchestrate', name: 'LLM Analysis', status: 'pending' },
+        { id: 'execute', name: 'Function Execution', status: 'pending' },
+        { id: 'respond', name: 'Response Sent', status: 'pending' }
+    ];
+    
+    // You can add a visual workflow indicator here
+}
+
 // Add initial logs
 setTimeout(() => {
-    logMessage('info', 'AI Agent Testing Interface ready');
+    logMessage('info', '🚀 AI Agent Testing Interface ready');
     logMessage('info', 'Use Ctrl+Enter to send messages, Ctrl+L to clear logs');
+    logMessage('info', 'Workflow: RabbitMQ → AgentMaster → LLM → JobQueue → Function → Response');
 }, 100);
